@@ -94,3 +94,82 @@ def fetch_lever(client, board):
         lists = job.get("lists") or []
         details = " ".join((item.get("content") or "") for item in lists if isinstance(item, dict))
         yield {
+            "source_id": f"lever:{board}:{job.get('id')}",
+            "title": job.get("text") or "",
+            "company": board,
+            "location": categories.get("location") or "",
+            "description": " ".join([job.get("descriptionPlain") or "", job.get("additionalPlain") or "", details]),
+            "url": job.get("hostedUrl") or "",
+        }
+
+
+def safe_url(url):
+    try:
+        parts = urlparse(url)
+        return parts.scheme == "https" and bool(parts.netloc)
+    except ValueError:
+        return False
+
+
+def save_job(db, job):
+    """Return 'updated' or 'new'; preserve existing application status."""
+    existing = db.table("jobs").select("id,status").eq("source_id", job["source_id"]).limit(1).execute().data or []
+    row = {k: job[k] for k in ("source_id", "title", "company", "location", "remote", "score", "url")}
+    if existing:
+        db.table("jobs").update({k: v for k, v in row.items() if k != "source_id"}).eq("source_id", job["source_id"]).execute()
+        return "updated"
+    row["status"] = "found"
+    db.table("jobs").insert(row).execute()
+    return "new"
+
+
+def main():
+    greenhouse = boards_from_env("GREENHOUSE_BOARDS")
+    lever = boards_from_env("LEVER_BOARDS")
+    if not greenhouse and not lever:
+        print("No boards configured; exiting.")
+        return
+    db = create_client(os.environ["SUPABASE_URL"], os.environ["SUPABASE_SERVICE_ROLE_KEY"])
+    totals = {k: 0 for k in ("analyzed", "role", "location", "score", "invalid", "new", "updated", "failures")}
+    with httpx.Client(timeout=30, follow_redirects=True) as client:
+        for source, boards, fetcher in (("greenhouse", greenhouse, fetch_greenhouse), ("lever", lever, fetch_lever)):
+            for board in boards:
+                stats = {k: 0 for k in totals}
+                try:
+                    for item in fetcher(client, board):
+                        stats["analyzed"] += 1
+                        if item["source_id"].endswith(":None") or not safe_url(item["url"]):
+                            stats["invalid"] += 1
+                            continue
+                        if not role_ok(item["title"]):
+                            stats["role"] += 1
+                            continue
+                        if not location_ok(item["location"], item["description"]):
+                            stats["location"] += 1
+                            continue
+                        score = score_job(item["title"], item["description"], item["location"])
+                        if score < MINIMUM_SAVE_SCORE:
+                            stats["score"] += 1
+                            continue
+                        location = normalize(item["location"])
+                        item.update(title=item["title"][:250], company=item["company"][:150],
+                                    location=item["location"][:250], score=score,
+                                    remote=any(has(location, x) for x in ("remote", "remoto")))
+                        outcome = save_job(db, item)
+                        stats[outcome] += 1
+                except (httpx.HTTPError, ValueError, KeyError, TypeError) as exc:
+                    stats["failures"] += 1
+                    print(f"{source}/{board}: ERROR {type(exc).__name__}: {exc}")
+                for key in totals:
+                    totals[key] += stats[key]
+                print(f"{source}/{board}: analyzed={stats['analyzed']} "
+                      f"excluded_role={stats['role']} excluded_location={stats['location']} "
+                      f"excluded_score={stats['score']} invalid={stats['invalid']} "
+                      f"new={stats['new']} updated={stats['updated']} errors={stats['failures']}")
+    print("TOTAL: " + " ".join(f"{key}={value}" for key, value in totals.items()))
+    if totals["failures"]:
+        raise SystemExit("One or more boards failed; review logs")
+
+
+if __name__ == "__main__":
+    main()
