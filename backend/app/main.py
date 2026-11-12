@@ -14,11 +14,17 @@ def settings():
 
 app = FastAPI(title='JobMatch AI API', version='0.1.0')
 # Configure CORS at startup from environment, not with wildcard origins.
-@app.on_event('startup')
-def startup():
-    s = settings()
-    app.add_middleware(CORSMiddleware, allow_origins=[s.frontend_origin.rstrip('/')],
-                       allow_credentials=False, allow_methods=['GET'], allow_headers=['Authorization'])
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        settings().frontend_origin.rstrip("/")
+    ],
+    allow_credentials=False,
+    allow_methods=["GET"],
+    allow_headers=["Authorization"],
+)
+
 
 @lru_cache
 def jwks_client():
