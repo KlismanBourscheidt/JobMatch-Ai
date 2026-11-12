@@ -7,6 +7,7 @@ from fastapi import Depends, FastAPI, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from supabase import create_client
 from .config import Settings
+from fastapi import Depends, FastAPI, Header, HTTPException, Request
 
 @lru_cache
 def settings():
@@ -52,6 +53,20 @@ def current_user(authorization: Annotated[str | None, Header()] = None):
 @app.get('/health')
 def health():
     return {'status': 'ok'}
+ 
+from fastapi import Request
+
+@app.get("/debug-headers")
+def debug_headers(request: Request):
+    authorization = request.headers.get("authorization")
+
+    return {
+        "authorization_present": bool(authorization),
+        "authorization_is_bearer": bool(
+            authorization and authorization.startswith("Bearer ")
+        ),
+    }
+
 
 @app.get('/jobs')
 def jobs(user=Depends(current_user)):
