@@ -1,20 +1,34 @@
+
 from functools import lru_cache
-from typing import Annotated
-import httpx
+
 import jwt
 from jwt import PyJWKClient
-from fastapi import Depends, FastAPI, Header, HTTPException
+
+from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from supabase import create_client
+
 from .config import Settings
-from fastapi import Depends, FastAPI, Header, HTTPException, Request
+
+
+# ==========================================
+# CONFIGURAÇÕES
+# ==========================================
 
 @lru_cache
 def settings():
     return Settings()
 
-app = FastAPI(title='JobMatch AI API', version='0.1.0')
-# Configure CORS at startup from environment, not with wildcard origins.
+
+app = FastAPI(
+    title="JobMatch AI API",
+    version="0.1.1"
+)
+
+
+# ==========================================
+# CORS
+# ==========================================
 
 app.add_middleware(
     CORSMiddleware,
@@ -23,54 +37,140 @@ app.add_middleware(
     ],
     allow_credentials=False,
     allow_methods=["GET"],
-    allow_headers=["Authorization"],
+    allow_headers=["Authorization", "Content-Type"],
 )
 
 
+# ==========================================
+# CHAVES PÚBLICAS DO SUPABASE
+# ==========================================
+
 @lru_cache
 def jwks_client():
-    return PyJWKClient(settings().supabase_url.rstrip('/') + '/auth/v1/.well-known/jwks.json')
+    supabase_url = settings().supabase_url.rstrip("/")
 
-def current_user(authorization: str | None = Header(default=None)):
-    if not authorization or not authorization.startswith('Bearer '):
-        raise HTTPException(401, 'Token ausente')
-    token = authorization.removeprefix('Bearer ').strip()
-    s = settings()
-    try:
-        header = jwt.get_unverified_header(token)
-        if header.get('alg') != 'ES256':
-            raise ValueError('Somente tokens ES256 são aceitos. Configure chave assimétrica ES256 no Supabase.')
-        key = jwks_client().get_signing_key_from_jwt(token)
-        payload = jwt.decode(token, key.key, algorithms=['ES256'],
-                             audience='authenticated',
-                             issuer=s.supabase_url.rstrip('/') + '/auth/v1/')
-    except Exception:
-        raise HTTPException(401, 'Token inválido ou expirado')
-    if payload.get('email', '').lower() != s.allowed_email.lower():
-        raise HTTPException(403, 'Conta não autorizada')
-    return payload
+    return PyJWKClient(
+        f"{supabase_url}/auth/v1/.well-known/jwks.json"
+    )
 
-@app.get('/health')
-def health():
-    return {'status': 'ok'}
- 
-from fastapi import Request
 
-@app.get("/debug-headers")
-def debug_headers(request: Request):
+# ==========================================
+# AUTENTICAÇÃO
+# ==========================================
+
+def current_user(request: Request):
+
+    # Ler o cabeçalho diretamente da requisição
     authorization = request.headers.get("authorization")
 
+    if not authorization:
+        raise HTTPException(
+            status_code=401,
+            detail="Token ausente"
+        )
+
+    scheme, separator, token = authorization.partition(" ")
+
+    if (
+        not separator
+        or scheme.lower() != "bearer"
+        or not token.strip()
+    ):
+        raise HTTPException(
+            status_code=401,
+            detail="Cabeçalho Authorization inválido"
+        )
+
+    token = token.strip()
+
+    s = settings()
+
+    try:
+
+        # Identificar o algoritmo do token
+        header = jwt.get_unverified_header(token)
+
+        if header.get("alg") != "ES256":
+            raise ValueError(
+                "Algoritmo JWT não permitido"
+            )
+
+        # Obter a chave pública correspondente
+        signing_key = jwks_client().get_signing_key_from_jwt(
+            token
+        )
+
+        # Validar assinatura e claims
+        payload = jwt.decode(
+            token,
+            signing_key.key,
+            algorithms=["ES256"],
+            audience="authenticated",
+            issuer=(
+                s.supabase_url.rstrip("/")
+                + "/auth/v1"
+            ),
+        )
+
+    except Exception:
+
+        raise HTTPException(
+            status_code=401,
+            detail="Token inválido ou expirado"
+        )
+
+    # Restringir acesso à conta autorizada
+    user_email = payload.get("email", "").lower()
+
+    if user_email != s.allowed_email.lower():
+        raise HTTPException(
+            status_code=403,
+            detail="Conta não autorizada"
+        )
+
+    return payload
+
+
+# ==========================================
+# HEALTH CHECK
+# ==========================================
+
+@app.get("/health")
+def health():
     return {
-        "authorization_present": bool(authorization),
-        "authorization_is_bearer": bool(
-            authorization and authorization.startswith("Bearer ")
-        ),
+        "status": "ok"
     }
 
 
-@app.get('/jobs')
+# ==========================================
+# LISTAGEM DE VAGAS
+# ==========================================
+
+@app.get("/jobs")
 def jobs(user=Depends(current_user)):
+
     s = settings()
-    db = create_client(s.supabase_url, s.supabase_service_role_key)
-    result = db.table('jobs').select('id,title,company,location,remote,score,status,url,created_at').order('score',desc=True).limit(500).execute()
-    return {'jobs': result.data or [], 'minimum_match_score': 80}
+
+    db = create_client(
+        s.supabase_url,
+        s.supabase_service_role_key
+    )
+
+    result = (
+        db.table("jobs")
+        .select(
+            "id,title,company,location,"
+            "remote,score,status,url,created_at"
+        )
+        .order(
+            "score",
+            desc=True
+        )
+        .limit(500)
+        .execute()
+    )
+
+    return {
+        "jobs": result.data or [],
+        "minimum_match_score": 80
+    }
