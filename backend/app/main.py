@@ -31,7 +31,7 @@ app.add_middleware(
 def jwks_client():
     return PyJWKClient(settings().supabase_url.rstrip('/') + '/auth/v1/.well-known/jwks.json')
 
-def current_user(authorization: Annotated[str | None, Header()] = None):
+def current_user(authorization: str | None = Header(default=None)):
     if not authorization or not authorization.startswith('Bearer '):
         raise HTTPException(401, 'Token ausente')
     token = authorization.removeprefix('Bearer ').strip()
