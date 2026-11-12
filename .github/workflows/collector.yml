@@ -1,26 +1,74 @@
+
 name: Daily job collector
+
 on:
   schedule:
-    - cron: '0 11 * * *' # Approx. 08:00 Curitiba (UTC-3), scheduling can be delayed
+    - cron: '0 11 * * *'
+
   workflow_dispatch:
+
 permissions:
   contents: read
+
 jobs:
   collect:
+    name: Collect job opportunities
     runs-on: ubuntu-latest
+
     defaults:
       run:
         working-directory: backend
+
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
         with:
           python-version: '3.12'
           cache: pip
           cache-dependency-path: backend/requirements.txt
-      - run: pip install -r requirements.txt
-      - run: python collector.py
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Validate configuration
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
           GREENHOUSE_BOARDS: ${{ vars.GREENHOUSE_BOARDS }}
+        run: |
+          python - <<'PY'
+          import os
+          import json
+
+          required = [
+              "SUPABASE_URL",
+              "SUPABASE_SERVICE_ROLE_KEY"
+          ]
+
+          for name in required:
+              if not os.getenv(name):
+                  raise SystemExit(
+                      f"Missing required secret: {name}"
+                  )
+
+          boards = json.loads(
+              os.getenv("GREENHOUSE_BOARDS") or "[]"
+          )
+
+          if not isinstance(boards, list):
+              raise SystemExit(
+                  "GREENHOUSE_BOARDS must be a JSON list"
+              )
+
+          print(f"Configured boards: {len(boards)}")
+          PY
+
+      - name: Run job collector
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          GREENHOUSE_BOARDS: ${{ vars.GREENHOUSE_BOARDS }}
+        run: python collector.py
