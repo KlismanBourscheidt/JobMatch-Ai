@@ -1,7 +1,4 @@
-"""JobMatch AI 0.3 diagnostics: public Greenhouse and Lever job ingestion.
-
-Read-only job board APIs. Does not submit applications.
-"""
+"""JobMatch AI 0.4: collect public Greenhouse/Lever vacancies; never apply."""
 import html
 import json
 import os
@@ -12,164 +9,171 @@ from urllib.parse import urlparse
 import httpx
 from supabase import create_client
 
-MINIMUM_SAVE_SCORE = 55
-SKILLS = {"php": 16, "javascript": 16, "html": 8, "css": 8, "mysql": 12,
-          "sql": 8, "python": 8, "git": 8, "react": 6, "api": 5, "github": 5}
-BLOCKED = ("senior", "sr", "staff", "principal", "lead", "pleno", "manager", "director", "head")
-LEVELS = ("estagio", "estagiario", "intern", "internship", "junior", "jr", "trainee", "entry level", "entry-level", "graduate", "associate")
-TECH = ("developer", "desenvolvedor", "desenvolvimento", "software", "programador", "frontend", "front-end", "backend", "back-end", "fullstack", "full-stack", "technology", "tecnologia", "ti", "it support", "technical support", "suporte tecnico", "help desk", "helpdesk", "service desk", "qa", "quality assurance", "test engineer", "data analyst", "analista de dados", "cybersecurity", "seguranca da informacao", "devops", "infrastructure", "infraestrutura")
-BOARD_TOKEN = re.compile(r"[A-Za-z0-9_-]{2,80}\Z")
+MINIMUM_MATCH = 50
+SKILLS = {
+    'php': ('php',), 'javascript': ('javascript', 'js'), 'html': ('html',),
+    'css': ('css',), 'mysql': ('mysql',), 'sql': ('sql',),
+    'python': ('python',), 'git': ('git',), 'github': ('github',),
+    'react': ('react', 'reactjs'), 'api': ('api', 'apis', 'rest api'),
+    'typescript': ('typescript',), 'node.js': ('node.js', 'nodejs'),
+    'laravel': ('laravel',), 'docker': ('docker',), 'aws': ('aws',),
+    'java': ('java',), 'spring': ('spring boot',), 'vue': ('vue', 'vuejs'),
+    'angular': ('angular',), 'postgresql': ('postgresql', 'postgres'),
+    'testing': ('unit testing', 'automated testing', 'testes automatizados', 'testes unitarios'),
+    'figma': ('figma',), 'excel': ('excel',), 'linux': ('linux',),
+}
+# Edit as skills are confirmed; this is not proof of proficiency.
+PROFILE = {'php', 'javascript', 'html', 'css', 'mysql', 'sql', 'python', 'git', 'github', 'figma'}
+BLOCKED = ('senior', 'sr', 'staff', 'principal', 'lead', 'pleno', 'manager', 'director', 'head', 'architect', 'arquiteto')
+ENTRY = ('estagio', 'estagiario', 'intern', 'internship', 'junior', 'jr', 'trainee', 'entry level', 'entry-level', 'graduate', 'associate', 'nivel i', 'level i', 'n1')
+TECH = ('developer', 'desenvolvedor', 'desenvolvimento', 'software', 'programador', 'frontend', 'front-end', 'backend', 'back-end', 'fullstack', 'full-stack', 'technology', 'tecnologia', 'ti', 'it support', 'technical support', 'suporte tecnico', 'help desk', 'helpdesk', 'service desk', 'qa', 'quality assurance', 'test engineer', 'data analyst', 'analista de dados', 'cybersecurity', 'seguranca da informacao', 'devops', 'infrastructure', 'infraestrutura', 'sistemas')
+BOARD = re.compile(r'[A-Za-z0-9_-]{2,80}\Z')
 
 
-def normalize(value):
-    value = re.sub(r"<[^>]*>", " ", html.unescape(str(value or "")))
-    value = unicodedata.normalize("NFKD", value)
-    return " ".join("".join(c for c in value if not unicodedata.combining(c)).lower().split())
+def norm(value):
+    text = re.sub(r'<[^>]*>', ' ', html.unescape(str(value or '')))
+    text = unicodedata.normalize('NFKD', text)
+    return ' '.join(''.join(c for c in text if not unicodedata.combining(c)).lower().split())
 
 
 def has(text, term):
-    return re.search(r"(?<!\w)" + re.escape(term) + r"(?!\w)", text) is not None
+    return re.search(r'(?<!\w)' + re.escape(term) + r'(?!\w)', text) is not None
 
 
 def role_ok(title):
-    title = normalize(title)
-    return (not any(has(title, x) for x in BLOCKED)
-            and any(has(title, x) for x in LEVELS)
-            and any(has(title, x) for x in TECH))
+    title = norm(title)
+    return (not any(has(title, t) for t in BLOCKED)
+            and any(has(title, t) for t in ENTRY)
+            and any(has(title, t) for t in TECH))
 
 
 def location_ok(location, description):
-    loc, desc = normalize(location), normalize(description)
-    if has(loc, "curitiba") or has(loc, "parana") or has(loc, "parana pr"):
+    loc, desc = norm(location), norm(description)
+    if has(loc, 'curitiba'):
         return True
-    # Brazil location is only accepted if explicitly remote/hybrid in Brazil.
-    brazil = any(has(loc, x) for x in ("brazil", "brasil"))
-    remote = any(has(loc, x) for x in ("remote", "remoto", "work from home", "home office"))
+    brazil = any(has(loc, t) for t in ('brazil', 'brasil'))
+    remote = any(has(loc, t) for t in ('remote', 'remoto', 'home office'))
     if brazil and remote:
         return True
-    if brazil and any(has(desc, x) for x in ("remote", "remoto", "home office", "trabalho remoto")):
+    if brazil and any(has(desc, t) for t in ('remote', 'remoto', 'home office', 'trabalho remoto')):
         return True
-    if remote and any(has(desc, x) for x in ("based in brazil", "based in brasil", "remote brazil", "remote brasil", "remoto brasil", "residir no brasil", "reside in brazil")):
+    if remote and any(has(desc, t) for t in ('based in brazil', 'based in brasil', 'remote brazil', 'remote brasil', 'remoto brasil', 'residir no brasil', 'reside in brazil')):
         return True
     return False
 
 
-def score_job(title, description, location):
-    if not role_ok(title) or not location_ok(location, description):
-        return 0
-    desc = normalize(description)
-    skills = sum(weight for skill, weight in SKILLS.items() if has(desc, skill))
-    return min(100, 30 + 15 + skills)
+def skills_in(description):
+    text = norm(description)
+    return sorted(k for k, aliases in SKILLS.items() if any(has(text, a) for a in aliases))
 
 
-def boards_from_env(name):
-    raw = os.getenv(name, "[]") or "[]"
-    values = json.loads(raw)
-    if not isinstance(values, list) or any(not isinstance(x, str) or not BOARD_TOKEN.fullmatch(x) for x in values):
-        raise ValueError(f"{name} must be a JSON array of board tokens")
+def analyze(job):
+    mentioned = skills_in(job['description'])
+    matched = sorted(set(mentioned) & PROFILE)
+    missing = sorted(set(mentioned) - PROFILE)
+    # Heuristic: keywords can be optional or incidental; not a hiring probability.
+    skill_points = round(50 * len(matched) / len(mentioned)) if mentioned else 0
+    score = min(100, 30 + 20 + skill_points)
+    recommendations = [f'Estudar {skill} e criar um pequeno projeto demonstrando seu uso.' for skill in missing[:3]]
+    if not mentioned:
+        recommendations = ['Revisar a descrição completa: não foram identificadas tecnologias específicas.']
+    return dict(score=score, matched_skills=matched, missing_skills=missing,
+                required_skills=mentioned, study_recommendations=recommendations)
+
+
+def boards(name):
+    values = json.loads(os.getenv(name, '[]') or '[]')
+    if not isinstance(values, list) or any(not isinstance(v, str) or not BOARD.fullmatch(v) for v in values):
+        raise ValueError(f'{name} deve ser uma lista JSON de identificadores')
     return list(dict.fromkeys(values))
 
 
-def fetch_greenhouse(client, board):
-    response = client.get(f"https://boards-api.greenhouse.io/v1/boards/{board}/jobs", params={"content": "true"})
+def greenhouse(client, board):
+    response = client.get(f'https://boards-api.greenhouse.io/v1/boards/{board}/jobs', params={'content': 'true'})
     response.raise_for_status()
-    for job in response.json().get("jobs", []):
-        yield {
-            "source_id": f"greenhouse:{board}:{job.get('id')}",
-            "title": job.get("title") or "",
-            "company": board,
-            "location": (job.get("location") or {}).get("name") or "",
-            "description": job.get("content") or "",
-            "url": job.get("absolute_url") or "",
-        }
+    for item in response.json().get('jobs', []):
+        yield dict(source_id=f"greenhouse:{board}:{item.get('id')}", title=item.get('title') or '',
+                   company=board, location=(item.get('location') or {}).get('name') or '',
+                   description=item.get('content') or '', url=item.get('absolute_url') or '')
 
 
-def fetch_lever(client, board):
-    # Lever public postings API (global and EU board hosts).
-    base = "https://api.lever.co/v0/postings"
-    response = client.get(f"{base}/{board}", params={"mode": "json"})
+def lever(client, board):
+    response = client.get(f'https://api.lever.co/v0/postings/{board}', params={'mode': 'json'})
     response.raise_for_status()
-    for job in response.json():
-        categories = job.get("categories") or {}
-        lists = job.get("lists") or []
-        details = " ".join((item.get("content") or "") for item in lists if isinstance(item, dict))
-        yield {
-            "source_id": f"lever:{board}:{job.get('id')}",
-            "title": job.get("text") or "",
-            "company": board,
-            "location": categories.get("location") or "",
-            "description": " ".join([job.get("descriptionPlain") or "", job.get("additionalPlain") or "", details]),
-            "url": job.get("hostedUrl") or "",
-        }
+    for item in response.json():
+        categories = item.get('categories') or {}
+        details = ' '.join(x.get('content') or '' for x in item.get('lists', []) if isinstance(x, dict))
+        yield dict(source_id=f"lever:{board}:{item.get('id')}", title=item.get('text') or '',
+                   company=board, location=categories.get('location') or '',
+                   description=' '.join([item.get('descriptionPlain') or '', item.get('additionalPlain') or '', details]),
+                   url=item.get('hostedUrl') or '')
 
 
-def safe_url(url):
+def valid_url(url):
     try:
-        parts = urlparse(url)
-        return parts.scheme == "https" and bool(parts.netloc)
-    except ValueError:
+        u = urlparse(url)
+        return u.scheme == 'https' and bool(u.netloc)
+    except (TypeError, ValueError):
         return False
 
 
-def save_job(db, job):
-    """Return 'updated' or 'new'; preserve existing application status."""
-    existing = db.table("jobs").select("id,status").eq("source_id", job["source_id"]).limit(1).execute().data or []
-    row = {k: job[k] for k in ("source_id", "title", "company", "location", "remote", "score", "url")}
+def save(db, job, analysis):
+    # Updating only selected columns preserves existing status (e.g. applied).
+    existing = db.table('jobs').select('id').eq('source_id', job['source_id']).limit(1).execute().data or []
+    row = {k: job[k] for k in ('title', 'company', 'location', 'remote', 'url')}
+    row.update(analysis)
     if existing:
-        db.table("jobs").update({k: v for k, v in row.items() if k != "source_id"}).eq("source_id", job["source_id"]).execute()
-        return "updated"
-    row["status"] = "found"
-    db.table("jobs").insert(row).execute()
-    return "new"
+        db.table('jobs').update(row).eq('source_id', job['source_id']).execute()
+        return 'updated'
+    row.update(source_id=job['source_id'], status='found')
+    db.table('jobs').insert(row).execute()
+    return 'new'
 
 
 def main():
-    greenhouse = boards_from_env("GREENHOUSE_BOARDS")
-    lever = boards_from_env("LEVER_BOARDS")
-    if not greenhouse and not lever:
-        print("No boards configured; exiting.")
+    sources = [('greenhouse', boards('GREENHOUSE_BOARDS'), greenhouse),
+               ('lever', boards('LEVER_BOARDS'), lever)]
+    if not any(identifiers for _, identifiers, _ in sources):
+        print('No boards configured; exiting.')
         return
-    db = create_client(os.environ["SUPABASE_URL"], os.environ["SUPABASE_SERVICE_ROLE_KEY"])
-    totals = {k: 0 for k in ("analyzed", "role", "location", "score", "invalid", "new", "updated", "failures")}
+    db = create_client(os.environ['SUPABASE_URL'], os.environ['SUPABASE_SERVICE_ROLE_KEY'])
+    totals = dict(analyzed=0, excluded_role=0, excluded_location=0, excluded_score=0,
+                  invalid=0, new=0, updated=0, errors=0)
     with httpx.Client(timeout=30, follow_redirects=True) as client:
-        for source, boards, fetcher in (("greenhouse", greenhouse, fetch_greenhouse), ("lever", lever, fetch_lever)):
-            for board in boards:
-                stats = {k: 0 for k in totals}
+        for source, identifiers, fetcher in sources:
+            for board in identifiers:
+                stats = dict.fromkeys(totals, 0)
                 try:
-                    for item in fetcher(client, board):
-                        stats["analyzed"] += 1
-                        if item["source_id"].endswith(":None") or not safe_url(item["url"]):
-                            stats["invalid"] += 1
+                    for job in fetcher(client, board):
+                        stats['analyzed'] += 1
+                        if job['source_id'].endswith(':None') or not valid_url(job['url']):
+                            stats['invalid'] += 1
                             continue
-                        if not role_ok(item["title"]):
-                            stats["role"] += 1
+                        if not role_ok(job['title']):
+                            stats['excluded_role'] += 1
                             continue
-                        if not location_ok(item["location"], item["description"]):
-                            stats["location"] += 1
+                        if not location_ok(job['location'], job['description']):
+                            stats['excluded_location'] += 1
                             continue
-                        score = score_job(item["title"], item["description"], item["location"])
-                        if score < MINIMUM_SAVE_SCORE:
-                            stats["score"] += 1
+                        analysis = analyze(job)
+                        if analysis['score'] < MINIMUM_MATCH:
+                            stats['excluded_score'] += 1
                             continue
-                        location = normalize(item["location"])
-                        item.update(title=item["title"][:250], company=item["company"][:150],
-                                    location=item["location"][:250], score=score,
-                                    remote=any(has(location, x) for x in ("remote", "remoto")))
-                        outcome = save_job(db, item)
-                        stats[outcome] += 1
-                except (httpx.HTTPError, ValueError, KeyError, TypeError) as exc:
-                    stats["failures"] += 1
-                    print(f"{source}/{board}: ERROR {type(exc).__name__}: {exc}")
+                        loc = norm(job['location'])
+                        job.update(title=job['title'][:250], company=job['company'][:150],
+                                   location=job['location'][:250],
+                                   remote=any(has(loc, t) for t in ('remote', 'remoto')))
+                        stats[save(db, job, analysis)] += 1
+                except (httpx.HTTPError, ValueError, KeyError, TypeError, RuntimeError) as exc:
+                    stats['errors'] += 1
+                    print(f'{source}/{board}: ERROR {type(exc).__name__}: {exc}')
                 for key in totals:
                     totals[key] += stats[key]
-                print(f"{source}/{board}: analyzed={stats['analyzed']} "
-                      f"excluded_role={stats['role']} excluded_location={stats['location']} "
-                      f"excluded_score={stats['score']} invalid={stats['invalid']} "
-                      f"new={stats['new']} updated={stats['updated']} errors={stats['failures']}")
-    print("TOTAL: " + " ".join(f"{key}={value}" for key, value in totals.items()))
-    if totals["failures"]:
-        raise SystemExit("One or more boards failed; review logs")
+                print(f'{source}/{board}: ' + ' '.join(f'{key}={value}' for key, value in stats.items()))
+    print('TOTAL: ' + ' '.join(f'{key}={value}' for key, value in totals.items()))
+    if totals['errors']:
+        raise SystemExit('Falha em uma ou mais fontes; consulte os logs')
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()

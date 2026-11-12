@@ -3,7 +3,6 @@ from functools import lru_cache
 
 import jwt
 from jwt import PyJWKClient
-
 from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from supabase import create_client
@@ -12,7 +11,7 @@ from .config import Settings
 
 
 # ==========================================
-# CONFIGURAÇÕES
+# CONFIGURACOES
 # ==========================================
 
 @lru_cache
@@ -22,7 +21,7 @@ def settings():
 
 app = FastAPI(
     title="JobMatch AI API",
-    version="0.1.1"
+    version="0.4.0"
 )
 
 
@@ -42,7 +41,7 @@ app.add_middleware(
 
 
 # ==========================================
-# CHAVES PÚBLICAS DO SUPABASE
+# CHAVES PUBLICAS DO SUPABASE
 # ==========================================
 
 @lru_cache
@@ -55,12 +54,10 @@ def jwks_client():
 
 
 # ==========================================
-# AUTENTICAÇÃO
+# AUTENTICACAO
 # ==========================================
 
 def current_user(request: Request):
-
-    # Ler o cabeçalho diretamente da requisição
     authorization = request.headers.get("authorization")
 
     if not authorization:
@@ -82,44 +79,32 @@ def current_user(request: Request):
         )
 
     token = token.strip()
-
     s = settings()
 
     try:
-
-        # Identificar o algoritmo do token
         header = jwt.get_unverified_header(token)
 
         if header.get("alg") != "ES256":
-            raise ValueError(
-                "Algoritmo JWT não permitido"
-            )
+            raise ValueError("Algoritmo JWT não permitido")
 
-        # Obter a chave pública correspondente
         signing_key = jwks_client().get_signing_key_from_jwt(
             token
         )
 
-        # Validar assinatura e claims
         payload = jwt.decode(
             token,
             signing_key.key,
             algorithms=["ES256"],
             audience="authenticated",
-            issuer=(
-                s.supabase_url.rstrip("/")
-                + "/auth/v1"
-            ),
+            issuer=s.supabase_url.rstrip("/") + "/auth/v1",
         )
 
     except Exception:
-
         raise HTTPException(
             status_code=401,
             detail="Token inválido ou expirado"
         )
 
-    # Restringir acesso à conta autorizada
     user_email = payload.get("email", "").lower()
 
     if user_email != s.allowed_email.lower():
@@ -137,9 +122,7 @@ def current_user(request: Request):
 
 @app.get("/health")
 def health():
-    return {
-        "status": "ok"
-    }
+    return {"status": "ok"}
 
 
 # ==========================================
@@ -148,7 +131,6 @@ def health():
 
 @app.get("/jobs")
 def jobs(user=Depends(current_user)):
-
     s = settings()
 
     db = create_client(
@@ -160,17 +142,17 @@ def jobs(user=Depends(current_user)):
         db.table("jobs")
         .select(
             "id,title,company,location,"
-            "remote,score,status,url,created_at"
+            "remote,score,status,url,created_at,"
+            "matched_skills,missing_skills,"
+            "required_skills,study_recommendations"
         )
-        .order(
-            "score",
-            desc=True
-        )
+        .order("score", desc=True)
         .limit(500)
         .execute()
     )
 
     return {
         "jobs": result.data or [],
-        "minimum_match_score": 80
+        "minimum_match_score": 50,
+        "highlight_match_score": 80
     }
